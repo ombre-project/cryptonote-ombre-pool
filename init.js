@@ -1,35 +1,28 @@
+/**
+ * Cryptonite Node.JS Pool
+ * https://github.com/dvandal/cryptonote-nodejs-pool
+ *
+ * Pool initialization script
+ **/
+
+// Load needed modules
 var fs = require('fs');
 var cluster = require('cluster');
 var os = require('os');
 
-var redis = require('redis');
-
-
+// Load configuration
 require('./lib/configReader.js');
 
+// Load log system
 require('./lib/logger.js');
 
+// Initialize redis database client
+var redis = require('redis');
 
-var logSystem = 'master';
-global.redisClient = redis.createClient(config.redis.port, config.redis.host, {
-    retry_strategy: function (options) {
-        if (options.total_retry_time > 1000 * 60 * 30) {
-            // End reconnecting after a specific timeout and flush all commands
-            // with a individual error
-            return new Error('Retry time exhausted');
-        }
-        if (options.attempt > 10) {
-            // End reconnecting with built in error
-						log('error', logSystem, 'Reddis client exceeded max retries');
-            return undefined;
-        }
-				log('error', logSystem, 'Reddis client needs to retry (attempt: %d)', [options.attempt]);
-        // Reconnect after this many seconds.
-        return options.attempt * 1000;
-    }
-});
+var redisDB = (config.redis.db && config.redis.db > 0) ? config.redis.db : 0;
+global.redisClient = redis.createClient(config.redis.port, config.redis.host, { db: redisDB, auth_pass: config.redis.auth });
 
-
+// Load pool modules
 if (cluster.isWorker){
     switch(process.env.workerType){
         case 'pool':
@@ -44,71 +37,66 @@ if (cluster.isWorker){
         case 'api':
             require('./lib/api.js');
             break;
-        case 'cli':
-            require('./lib/cli.js');
-            break
         case 'chartsDataCollector':
             require('./lib/chartsDataCollector.js');
-            break
-
+            break;
+        case 'telegramBot':
+            require('./lib/telegramBot.js');
+            break;
     }
     return;
 }
 
+// Initialize log system
+var logSystem = 'master';
 require('./lib/exceptionWriter.js')(logSystem);
 
-
-var selectedModules = (function(){
-
-    var validModules = ['pool', 'api', 'unlocker', 'payments', 'chartsDataCollector'];
+// Pool informations
+log('info', logSystem, 'Starting Cryptonote Node.JS pool version %s', [version]);
+ 
+// Run a single module ?
+var singleModule = (function(){
+    var validModules = ['pool', 'api', 'unlocker', 'payments', 'chartsDataCollector', 'telegramBot'];
 
     for (var i = 0; i < process.argv.length; i++){
         if (process.argv[i].indexOf('-module=') === 0){
-            var modulesStr = process.argv[i].split('=')[1];
-            var moduleNames = modulesStr.split(',');
-            for(var j = 0; j < moduleNames.length;j++)
-            {
-                var module = moduleNames[j];
-                if (!(validModules.indexOf(module) > -1))
-                {
-                    log('error', logSystem, 'Invalid module "%s", valid modules: %s', [module, validModules.join(', ')]);
-                    process.exit();
-                }
-                return moduleNames;
-            }
+            var moduleName = process.argv[i].split('=')[1];
+            if (validModules.indexOf(moduleName) > -1)
+                return moduleName;
+
+            log('error', logSystem, 'Invalid module "%s", valid modules: %s', [moduleName, validModules.join(', ')]);
+            process.exit();
         }
     }
 })();
 
-
+/**
+ * Start modules
+ **/
 (function init(){
-
     checkRedisVersion(function(){
+        if (singleModule){
+            log('info', logSystem, 'Running in single module mode: %s', [singleModule]);
 
-        if (selectedModules){
-            log('info', logSystem, 'Running in selected module mode: %s', [selectedModules]);
-            for (var i = 0; i < selectedModules.length; i++){
-                var selectedModule = selectedModules[i];
-                switch(selectedModule){
-                    case 'pool':
-                        spawnPoolWorkers();
-                        break;
-                    case 'unlocker':
-                        spawnBlockUnlocker();
-                        break;
-                    case 'payments':
-                        spawnPaymentProcessor();
-                        break;
-                    case 'api':
-                        spawnApi();
-                        break;
-                    case 'chartsDataCollector':
-                        spawnChartsDataCollector();
-                        break;
-                    case 'purchases':
-                        spawnPurchaseProcessor();
-                        break;
-                }
+            switch(singleModule){
+                case 'pool':
+                    spawnPoolWorkers();
+                    break;
+                case 'unlocker':
+                    spawnBlockUnlocker();
+                    break;
+                case 'payments':
+                    spawnPaymentProcessor();
+                    break;
+                case 'api':
+                    spawnApi();
+                    break;
+                case 'chartsDataCollector':
+                    spawnChartsDataCollector();
+                    break;
+                case 'telegramBot':
+                    spawnTelegramBot();
+                    break;
             }
         }
         else{
@@ -117,16 +105,15 @@ var selectedModules = (function(){
             spawnPaymentProcessor();
             spawnApi();
             spawnChartsDataCollector();
+            spawnTelegramBot();
         }
-
-        spawnCli();
-
     });
 })();
 
-
+/**
+ * Check redis database version
+ **/
 function checkRedisVersion(callback){
-
     redisClient.info(function(error, response){
         if (error){
             log('error', logSystem, 'Redis version check failed');
@@ -157,15 +144,16 @@ function checkRedisVersion(callback){
     });
 }
 
+/**
+ * Spawn pool workers module
+ **/
 function spawnPoolWorkers(){
-
     if (!config.poolServer || !config.poolServer.enabled || !config.poolServer.ports || config.poolServer.ports.length === 0) return;
 
     if (config.poolServer.ports.length === 0){
         log('error', logSystem, 'Pool server enabled but no ports specified');
         return;
     }
-
 
     var numForks = (function(){
         if (!config.poolServer.clusterForks)
@@ -216,8 +204,10 @@ function spawnPoolWorkers(){
     }, 10);
 }
 
+/**
+ * Spawn block unlocker module
+ **/
 function spawnBlockUnlocker(){
-
     if (!config.blockUnlocker || !config.blockUnlocker.enabled) return;
 
     var worker = cluster.fork({
@@ -229,11 +219,12 @@ function spawnBlockUnlocker(){
             spawnBlockUnlocker();
         }, 2000);
     });
-
 }
 
+/**
+ * Spawn payment processor module
+ **/
 function spawnPaymentProcessor(){
-
     if (!config.payments || !config.payments.enabled) return;
 
     var worker = cluster.fork({
@@ -247,6 +238,9 @@ function spawnPaymentProcessor(){
     });
 }
 
+/**
+ * Spawn API module
+ **/
 function spawnApi(){
     if (!config.api || !config.api.enabled) return;
 
@@ -261,10 +255,9 @@ function spawnApi(){
     });
 }
 
-function spawnCli(){
-
-}
-
+/**
+ * Spawn charts data collector module
+ **/
 function spawnChartsDataCollector(){
     if (!config.charts) return;
 
@@ -275,6 +268,23 @@ function spawnChartsDataCollector(){
         log('error', logSystem, 'chartsDataCollector died, spawning replacement...');
         setTimeout(function(){
             spawnChartsDataCollector();
+        }, 2000);
+    });
+}
+
+/**
+ * Spawn telegram bot module
+ **/
+function spawnTelegramBot(){
+    if (!config.telegram || !config.telegram.enabled || !config.telegram.token) return;
+
+    var worker = cluster.fork({
+        workerType: 'telegramBot'
+    });
+    worker.on('exit', function(code, signal){
+        log('error', logSystem, 'telegramBot died, spawning replacement...');
+        setTimeout(function(){
+            spawnTelegramBot();
         }, 2000);
     });
 }
